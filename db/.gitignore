@@ -1,0 +1,4 @@
+# HMS data dump. Regenerate with ../scripts/dump-hms-data.sh.
+# Not committed because it's large (137M as of the last prod dump) and
+# contains real patient data.
+05-hms-data.dmp

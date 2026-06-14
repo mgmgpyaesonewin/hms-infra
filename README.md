@@ -11,6 +11,23 @@ This is a **dev-only** stack. Production deploys are:
   (see `hms-docs/summary-service/ops/`).
 - **Postgres / Redis** — on the host (or whatever hospital IT provides).
 
+## What's in the dev DB on first boot
+
+Postgres auto-runs these from `./db` in alphabetical order on first init
+(empty `postgres_data` volume):
+
+| File | Purpose | Committed? |
+| --- | --- | --- |
+| `01-hms-schema.sql` | 236 HMS tables (dumped from prod RDS) | yes (small, 523k) |
+| `02-summary-dev-bridge.sql` | plpgsql `uuidv7()` wrapper + pgcrypto (prod has the real C extension) | yes |
+| `03-summary-schema.sql` | 4 summary-service tables + indexes | yes |
+| `04-import-hms-data.sh` | wrapper that TRUNCATEs, disables FK triggers, loads the data, re-enables | yes |
+| `05-hms-data.dmp` | real HMS rows from prod (`pg_dump --data-only`) | **no** — gitignored, ~140MB, contains real patient data |
+
+If `05-hms-data.dmp` is missing, the dev stack still starts cleanly — it
+just has empty HMS tables. To load real data, run `scripts/dump-hms-data.sh`
+once (see "Populating real data" below), then `docker compose down -v && up`.
+
 ## One-time setup
 
 ```bash
@@ -101,6 +118,28 @@ SQL
 # (You also need a real OPD billing row for the handler to read; see the
 # schema's notes on which HMS tables the worker queries.)
 ```
+
+## Populating real data (optional)
+
+If you want the dev stack to have real HMS rows (so the summary worker
+can process real OPD billings end-to-end):
+
+```bash
+cd infra
+
+# Generate the data dump from prod RDS (~140MB, gitignored).
+RDS_URL='postgres://USER:PASS@HOST:5432/ycare_hms_dev?sslmode=require' \
+  ./scripts/dump-hms-data.sh
+
+# Wipe the dev volume and re-apply everything (schema + your data dump).
+docker compose down -v
+docker compose up -d
+```
+
+The data dump is loaded by `db/04-import-hms-data.sh` with FK triggers
+disabled — the HMS data has circular FKs (departments ↔ users, bills ↔
+opd_billings ↔ pharmacy_sales, etc.) that pg_dump can't satisfy without
+this trick.
 
 ## Things to know
 
