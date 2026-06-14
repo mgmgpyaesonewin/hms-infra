@@ -1,0 +1,154 @@
+# =============================================================================
+# YCare HMS — local dev stack
+# -----------------------------------------------------------------------------
+# Spins up the full system on a single Docker network so the HMS BFF can
+# reach the summary service by service name (e.g. http://summary-api:4000).
+#
+# This is a DEV-ONLY stack. Production deploys are:
+#   - hms-app:           ECR + Kubernetes (see hms-app/Dockerfile)
+#   - hms-summary-service: systemd units on the on-prem host (see
+#                         hms-docs/summary-service/ops/)
+# Postgres + Redis run as containers here for parity with dev; in production
+# they run on the host (or whatever the hospital IT provides).
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Postgres — same image and credentials as hms-app/docker-compose.yml so the
+  # dev DB contract is identical whether you use the legacy single-service
+  # compose or this full stack.
+  #
+  # /docker-entrypoint-initdb.d/ is run on FIRST init only (when
+  # postgres_data is empty). Re-running `docker compose up` against an
+  # existing volume does NOT re-apply them — to re-bootstrap, run
+  # `docker compose down -v` first. The files are applied alphabetically:
+  #   01-hms-schema.sql        — 236 HMS tables dumped from prod RDS
+  #   02-summary-dev-bridge.sql — uuidv7() plpgsql wrapper + pgcrypto
+  #   03-summary-schema.sql    — event_outbox + CFI tables (canonical DDL)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: testtest
+      POSTGRES_DB: ycare_hms_dev
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5433:5432"   # 5433 on host to match the legacy compose; 5432 in-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d ycare_hms_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Redis — local-only, used by the summary service for aggregate counters
+  # (ADR 0009). Not exposed outside the compose network in production, but
+  # mapped to localhost:6379 here so `redis-cli` from the host works.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # hms-app — Next.js dev server with Turbopack hot-reload.
+  # Binds to 0.0.0.0:3000. The DATABASE_URL points at the in-network
+  # `postgres` service, not localhost.
+  # ---------------------------------------------------------------------------
+  hms-app:
+    image: node:20-alpine
+    working_dir: /app
+    entrypoint: ["/scripts/dev-entrypoint.sh"]
+    command: ["npm", "run", "dev"]
+    environment:
+      DATABASE_URL: postgres://admin:testtest@postgres:5432/ycare_hms_dev
+      # The user's hms-app/.env provides the rest (module toggles, AWS keys,
+      # etc.). env_file is loaded AFTER `environment:`, so it overrides.
+      NODE_ENV: development
+    env_file:
+      - ../hms-app/.env
+    volumes:
+      - ../hms-app:/app
+      # Anonymous volume layered on top of the bind mount — keeps the
+      # container's node_modules isolated from the host checkout.
+      - /app/node_modules
+      - /app/.next
+      - ./scripts:/scripts:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # summary-api — the Express service in API mode.
+  # BIND_ADDRESS=0.0.0.0 so the hms-app container (and the host) can reach it.
+  # HMAC_SECRET_PATH points at the bind-mounted shared secret file.
+  # ---------------------------------------------------------------------------
+  summary-api:
+    image: node:20-alpine
+    working_dir: /app
+    entrypoint: ["/scripts/dev-entrypoint.sh"]
+    command: ["npm", "run", "dev:api"]
+    environment:
+      DATABASE_URL: postgres://admin:testtest@postgres:5432/ycare_hms_dev
+      REDIS_URL: redis://redis:6379/0
+      PORT: 4000
+      BIND_ADDRESS: 0.0.0.0
+      HMAC_SECRET_PATH: /run/secrets/hmac-shared-secret
+      NODE_ENV: development
+      LOG_LEVEL: info
+    volumes:
+      - ../hms-summary-service:/app
+      - /app/node_modules
+      - /app/dist
+      - ./secrets/hmac-shared-secret:/run/secrets/hmac-shared-secret:ro
+      - ./scripts:/scripts:ro
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # summary-worker — same image, different mode. Separate container so a
+  # crash in one doesn't take down the other (ADR 0002: two systemd units,
+  # one binary). No published port; it only talks to Postgres + Redis.
+  # ---------------------------------------------------------------------------
+  summary-worker:
+    image: node:20-alpine
+    working_dir: /app
+    entrypoint: ["/scripts/dev-entrypoint.sh"]
+    command: ["npm", "run", "dev:worker"]
+    environment:
+      DATABASE_URL: postgres://admin:testtest@postgres:5432/ycare_hms_dev
+      REDIS_URL: redis://redis:6379/0
+      HMAC_SECRET_PATH: /run/secrets/hmac-shared-secret
+      NODE_ENV: development
+      LOG_LEVEL: info
+    volumes:
+      - ../hms-summary-service:/app
+      - /app/node_modules
+      - /app/dist
+      - ./secrets/hmac-shared-secret:/run/secrets/hmac-shared-secret:ro
+      - ./scripts:/scripts:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
