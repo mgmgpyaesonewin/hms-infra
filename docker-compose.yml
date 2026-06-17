@@ -93,7 +93,8 @@ services:
   # ---------------------------------------------------------------------------
   # summary-api — the Express service in API mode.
   # BIND_ADDRESS=0.0.0.0 so the hms-app container (and the host) can reach it.
-  # HMAC_SECRET_PATH points at the bind-mounted shared secret file.
+  # v1 has no service-to-service auth; the BFF passes X-Tenant-Id as a plain
+  # header that the tenant-guard middleware validates (see ADR 0007).
   # ---------------------------------------------------------------------------
   summary-api:
     image: node:20-alpine
@@ -105,14 +106,12 @@ services:
       REDIS_URL: redis://redis:6379/0
       PORT: 4000
       BIND_ADDRESS: 0.0.0.0
-      HMAC_SECRET_PATH: /run/secrets/hmac-shared-secret
       NODE_ENV: development
       LOG_LEVEL: info
     volumes:
       - ../hms-summary-service:/app
       - /app/node_modules
       - /app/dist
-      - ./secrets/hmac-shared-secret:/run/secrets/hmac-shared-secret:ro
       - ./scripts:/scripts:ro
     ports:
       - "4000:4000"
@@ -135,14 +134,12 @@ services:
     environment:
       DATABASE_URL: postgres://admin:testtest@postgres:5432/ycare_hms_dev
       REDIS_URL: redis://redis:6379/0
-      HMAC_SECRET_PATH: /run/secrets/hmac-shared-secret
       NODE_ENV: development
       LOG_LEVEL: info
     volumes:
       - ../hms-summary-service:/app
       - /app/node_modules
       - /app/dist
-      - ./secrets/hmac-shared-secret:/run/secrets/hmac-shared-secret:ro
       - ./scripts:/scripts:ro
     depends_on:
       postgres:

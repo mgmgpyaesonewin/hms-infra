@@ -1,8 +1,9 @@
 #!/bin/bash
 # End-to-end API smoke test for the summary service.
-# Signs every request with HMAC-SHA256 (per api/hmac-auth.md) and
-# exercises the full flow: list, aggregates, detail, status change,
-# adjustment, and the error paths (auth, invalid transition, locked
+# v1 has no service-to-service auth — the BFF just passes X-Tenant-Id as
+# a plain header (validated by the tenant-guard middleware, ADR 0007).
+# This script exercises the full flow: list, aggregates, detail, status
+# change, adjustment, and the error paths (invalid transition, locked
 # adjustment, cross-tenant 404).
 #
 # Run from the workspace root:
@@ -16,13 +17,10 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 API=http://localhost:4000
-SECRET=$(cat infra/secrets/hmac-shared-secret)
-SERVICE_ID="hms-bff"
 
 TENANT_1=00000000-0000-0000-0000-000000000001   # has CFI 019ec55a... amount 3000
 TENANT_3=00000000-0000-0000-0000-000000000003   # has CFI 019ec570... amount 245000
 TENANT_4=00000000-0000-0000-0000-000000000004   # created inline by the test #4 setup
-WRONG_TENANT=ffffffff-ffff-ffff-ffff-ffffffffffff
 
 CFI_1=019ec55a-d656-72f0-ae65-c8e474905518
 CFI_3=019ec570-f8a3-7360-8d5f-50583c9328d8
@@ -62,30 +60,18 @@ CFI_ROWS_AFTER_RESET=$(docker exec infra-postgres-1 psql -U admin -d ycare_hms_d
 # Helpers
 # ---------------------------------------------------------------------------
 
-# sign METHOD PATH BODY TENANT → echoes 4 header lines
-sign() {
-  local method="$1" path="$2" body="$3" tenant="$4"
-  local ts; ts=$(date +%s)
-  local body_hash
-  body_hash=$(printf '%s' "$body" | openssl dgst -sha256 -hex | awk '{print $NF}')
-  local canonical
-  canonical=$(printf '%s\n%s\n%s\n%s\n%s\n%s' "$method" "$path" "$body_hash" "$ts" "$SERVICE_ID" "$tenant")
-  local sig
-  sig=$(printf '%s' "$canonical" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $NF}')
-  printf 'X-Service-Id: %s\nX-Signature: %s\nX-Timestamp: %s\nX-Tenant-Id: %s\n' \
-    "$SERVICE_ID" "$sig" "$ts" "$tenant"
+# tenant_hdr TENANT → echoes the X-Tenant-Id header line
+tenant_hdr() {
+  printf 'X-Tenant-Id: %s\n' "$1"
 }
 
 # call METHOD PATH TENANT BODY EXTRA_HEADERS → echoes status + body
 call() {
   local method="$1" path="$2" tenant="$3" body="${4:-}" extra="${5:-}"
-  local hdrs; hdrs=$(sign "$method" "$path" "$body" "$tenant")
   local args=(-sS -o /tmp/_body.json -w "%{http_code}" -D /tmp/_headers.txt
               -X "$method" "$API$path"
-              -H "Content-Type: application/json")
-  while IFS= read -r line; do
-    [ -n "$line" ] && args+=(-H "$line")
-  done <<< "$hdrs"
+              -H "Content-Type: application/json"
+              -H "X-Tenant-Id: $tenant")
   if [ -n "$extra" ]; then
     while IFS= read -r line; do
       [ -n "$line" ] && args+=(-H "$line")
@@ -106,14 +92,11 @@ md_escape() { printf '%s' "$1" | sed 's/`/\\`/g'; }
 # show_req METHOD PATH TENANT BODY EXTRA_HEADERS → echoes "request" markdown
 show_req() {
   local method="$1" path="$2" tenant="$3" body="${4:-}" extra="${5:-}"
-  local hdrs; hdrs=$(sign "$method" "$path" "$body" "$tenant")
   echo '```http'
   echo "$method $path HTTP/1.1"
   echo "Host: localhost:4000"
   echo "Content-Type: application/json"
-  while IFS= read -r line; do
-    [ -n "$line" ] && echo "$line"
-  done <<< "$hdrs"
+  echo "X-Tenant-Id: $tenant"
   if [ -n "$extra" ]; then
     while IFS= read -r line; do
       [ -n "$line" ] && echo "$line"
@@ -121,18 +104,6 @@ show_req() {
   fi
   if [ -n "$body" ]; then
     echo
-    echo "$body" | python3 -m json.tool 2>/dev/null || echo "$body"
-  fi
-  echo '```'
-}
-
-# show_res STATUS BODY → echoes "response" markdown
-show_res() {
-  local body="$1" status="$2"
-  echo "**Status:** $status"
-  echo
-  echo '```json'
-  if [ -n "$body" ]; then
     echo "$body" | python3 -m json.tool 2>/dev/null || echo "$body"
   fi
   echo '```'
@@ -152,13 +123,10 @@ test() {
   echo
   show_req "$method" "$path" "$tenant" "$body" "$extra"
   # Actually perform the call
-  local hdrs; hdrs=$(sign "$method" "$path" "$body" "$tenant")
   local args=(-sS -o /tmp/_body.json -w "%{http_code}" -D /tmp/_headers.txt
               -X "$method" "$API$path"
-              -H "Content-Type: application/json")
-  while IFS= read -r line; do
-    [ -n "$line" ] && args+=(-H "$line")
-  done <<< "$hdrs"
+              -H "Content-Type: application/json"
+              -H "X-Tenant-Id: $tenant")
   if [ -n "$extra" ]; then
     while IFS= read -r line; do
       [ -n "$line" ] && args+=(-H "$line")
@@ -184,28 +152,6 @@ test() {
   echo '```'
 }
 
-# raw_call: like call() but for unauthenticated cases (no signing)
-raw_call() {
-  local method="$1" path="$2" extra="${3:-}" body="${4:-}"
-  local args=(-sS -o /tmp/_body.json -w "%{http_code}" -D /tmp/_headers.txt
-              -X "$method" "$API$path")
-  if [ -n "$extra" ]; then
-    while IFS= read -r line; do
-      [ -n "$line" ] && args+=(-H "$line")
-    done <<< "$extra"
-  fi
-  [ -n "$body" ] && args+=(-d "$body")
-  local code; code=$(curl "${args[@]}")
-  local resp_body; resp_body=$(cat /tmp/_body.json)
-  echo "**Status:** $code"
-  echo
-  echo '```json'
-  if [ -n "$resp_body" ]; then
-    echo "$resp_body" | python3 -m json.tool 2>/dev/null || echo "$resp_body"
-  fi
-  echo '```'
-}
-
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -215,14 +161,13 @@ cat <<EOF
 
 - **Generated:** $NOW_ISO
 - **API base:** $API
-- **Service ID:** $SERVICE_ID
 - **Test data:** 2 UNPAID CFIs in the dev DB (from earlier end-to-end worker tests)
   - CFI 1: \`$CFI_1\` — tenant \`$TENANT_1\`, amount 3000.00
   - CFI 2: \`$CFI_3\` — tenant \`$TENANT_3\`, amount 245000.00
 
-Auth scheme: HMAC-SHA256 over \`METHOD\\nPATH\\nSHA256(BODY)\\nTIMESTAMP\\nSERVICE_ID\\nTENANT_ID\`
-(per \`hms-docs/summary-service/api/hmac-auth.md\`). Every signed request below
-includes the actual \`X-Signature\` and \`X-Timestamp\` that was used.
+Auth: **none in v1.** Every request below carries only the required
+\`X-Tenant-Id\` header (validated by the tenant-guard middleware, ADR 0007).
+Real service-to-service auth is a v2 follow-up.
 
 ---
 
@@ -255,120 +200,11 @@ DEL summary:consultation_fees:00000000-0000-0000-0000-000000000004:2026-06-13:al
 
 ---
 
-## Section 1 — Auth enforcement (negative tests)
+## Section 1 — Read flow (happy path)
 
-The HMAC middleware must reject: missing headers, unknown service, bad
-signature, stale timestamp, non-UUID tenant, and replayed signatures.
 EOF
 
-# 1.1 missing headers
-cat <<'NOTE'
-
-
-NOTE
-echo "### 1.1 No auth headers"
-echo
-echo "**Request:**"
-echo
-echo '```http'
-echo "GET /consultation-fees-invoices HTTP/1.1"
-echo "Host: localhost:4000"
-echo '```'
-raw_call GET /consultation-fees-invoices
-
-# 1.2 unknown service
-cat <<'NOTE'
-
-
-NOTE
-echo '### 1.2 Wrong `X-Service-Id`'
-echo
-echo "**Request:**"
-echo
-echo '```http'
-echo "GET /consultation-fees-invoices HTTP/1.1"
-echo "Host: localhost:4000"
-echo "X-Service-Id: not-the-bff"
-echo "X-Signature: 00"
-echo "X-Timestamp: $(date +%s)"
-echo "X-Tenant-Id: $TENANT_1"
-echo '```'
-raw_call GET /consultation-fees-invoices "X-Service-Id: not-the-bff
-X-Signature: 00
-X-Timestamp: $(date +%s)
-X-Tenant-Id: $TENANT_1"
-
-# 1.3 stale timestamp
-cat <<'NOTE'
-
-
-NOTE
-echo '### 1.3 Stale `X-Timestamp` (1 hour old)'
-echo
-STALE_TS=$(( $(date +%s) - 3600 ))
-H=$(sign GET /consultation-fees-invoices "" "$TENANT_1")
-# Rebuild with stale ts: re-sign manually
-PATH_P="/consultation-fees-invoices"
-BODY_P=""
-BODY_HASH=$(printf '%s' "$BODY_P" | openssl dgst -sha256 -hex | awk '{print $NF}')
-CANON=$(printf '%s\n%s\n%s\n%s\n%s\n%s' "GET" "$PATH_P" "$BODY_HASH" "$STALE_TS" "$SERVICE_ID" "$TENANT_1")
-SIG=$(printf '%s' "$CANON" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $NF}')
-echo "**Request:**"
-echo
-echo '```http'
-echo "GET /consultation-fees-invoices HTTP/1.1"
-echo "Host: localhost:4000"
-echo "X-Service-Id: $SERVICE_ID"
-echo "X-Signature: $SIG"
-echo "X-Timestamp: $STALE_TS"
-echo "X-Tenant-Id: $TENANT_1"
-echo '```'
-curl -sS -o /tmp/_body.json -w "**Status:** %{http_code}\n" \
-  "$API$PATH_P" \
-  -H "X-Service-Id: $SERVICE_ID" \
-  -H "X-Signature: $SIG" \
-  -H "X-Timestamp: $STALE_TS" \
-  -H "X-Tenant-Id: $TENANT_1"
-echo
-echo '```json'
-cat /tmp/_body.json | python3 -m json.tool 2>/dev/null || cat /tmp/_body.json
-echo '```'
-
-# 1.4 non-UUID tenant
-cat <<'NOTE'
-
-
-NOTE
-echo '### 1.4 Non-UUID `X-Tenant-Id`'
-echo
-BAD_TENANT="not-a-uuid"
-TS=$(date +%s)
-BODY_HASH=$(printf '' | openssl dgst -sha256 -hex | awk '{print $NF}')
-CANON=$(printf '%s\n%s\n%s\n%s\n%s\n%s' "GET" "/consultation-fees-invoices" "$BODY_HASH" "$TS" "$SERVICE_ID" "$BAD_TENANT")
-SIG=$(printf '%s' "$CANON" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $NF}')
-echo "**Request:**"
-echo
-echo '```http'
-echo "GET /consultation-fees-invoices HTTP/1.1"
-echo "Host: localhost:4000"
-echo "X-Service-Id: $SERVICE_ID"
-echo "X-Signature: $SIG"
-echo "X-Timestamp: $TS"
-echo "X-Tenant-Id: $BAD_TENANT"
-echo '```'
-curl -sS -o /tmp/_body.json -w "**Status:** %{http_code}\n" "$API/consultation-fees-invoices" \
-  -H "X-Service-Id: $SERVICE_ID" -H "X-Signature: $SIG" -H "X-Timestamp: $TS" -H "X-Tenant-Id: $BAD_TENANT"
-echo
-echo '```json'
-cat /tmp/_body.json | python3 -m json.tool 2>/dev/null || cat /tmp/_body.json
-echo '```'
-
-# ---------------------------------------------------------------------------
 cat <<NOTE
-
----
-
-## Section 2 — Read flow (happy path)
 
 
 NOTE
@@ -406,7 +242,7 @@ cat <<NOTE
 NOTE
 test "Get CFI detail (tenant 3 trying to read tenant 1's CFI — must 404)" \
   GET "/consultation-fees-invoices/$CFI_1" "$TENANT_3" "" "" \
-  "ADR 0012 failure mode 6: cross-tenant access returns 404 to not leak existence."
+  "ADR 0012 failure mode 6: cross-tenant access returns 404 to not leak existence (tenant-scope defense in ADR 0007)."
 
 cat <<NOTE
 
@@ -429,7 +265,7 @@ cat <<NOTE
 
 ---
 
-## Section 3 — Status change flow
+## Section 2 — Status change flow
 
 
 NOTE
@@ -492,7 +328,7 @@ cat <<NOTE
 
 ---
 
-## Section 4 — Adjustment flow (on a fresh UNPAID CFI)
+## Section 3 — Adjustment flow (on a fresh UNPAID CFI)
 
 We need a 3rd UNPAID CFI to exercise the happy-path adjustment. Create one
 inline by inserting a new outbox event for a different OPD billing.
@@ -570,7 +406,7 @@ cat <<NOTE
 
 ---
 
-## Section 5 — Version mismatch
+## Section 4 — Version mismatch
 
 
 NOTE
@@ -585,7 +421,7 @@ cat <<NOTE
 
 ---
 
-## Section 6 — Cross-tenant write protection
+## Section 5 — Cross-tenant write protection
 
 
 NOTE

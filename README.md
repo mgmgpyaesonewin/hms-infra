@@ -33,17 +33,11 @@ once (see "Populating real data" below), then `docker compose down -v && up`.
 ```bash
 cd infra
 
-# 1. HMAC shared secret (the summary service refuses to start without it).
-#    Pick any random string for local dev; production uses the same secret
-#    the HMS BFF signs with.
-openssl rand -hex 32 > secrets/hmac-shared-secret
-chmod 0400 secrets/hmac-shared-secret
-
-# 2. Copy your hms-app/.env into place if you don't have one yet.
+# 1. Copy your hms-app/.env into place if you don't have one yet.
 cp ../hms-app/.env.example ../hms-app/.env
 #    Edit it: set DATABASE_URL, AWS keys, module toggles, etc.
 
-# 3. (Optional) copy this file's env overrides.
+# 2. (Optional) copy this file's env overrides.
 cp .env.example .env
 ```
 
@@ -164,9 +158,10 @@ this trick.
 - **BIND_ADDRESS for the summary service is `0.0.0.0`** in this stack, so
   the hms-app container and the host can both reach it. Production binds to
   `127.0.0.1` (see ADR 0002 and the systemd unit).
-- **HMAC verification is on by default.** Hitting `http://localhost:4000`
-  with `curl` from the host gets a 401 — the BFF signs with the secret in
-  `infra/secrets/hmac-shared-secret`. Use a real client, or sign by hand.
+- **No service-to-service auth in v1.** Hitting `http://localhost:4000`
+  with `curl` from the host works without any headers. The BFF passes
+  `X-Tenant-Id` as a plain header (validated by the tenant-guard
+  middleware). Real auth is a v2 follow-up.
 - **Database is the same one** that `hms-app/docker-compose up db` uses. If
   you've been running the legacy single-service compose, your existing
   `ycare_hms_dev` data is in a `hms-app_postgres_data` volume; the new
