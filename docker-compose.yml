@@ -78,7 +78,6 @@ services:
       # The user's Ycare-HMS/.env provides the rest (module toggles, AWS keys,
       # etc.). env_file is loaded AFTER `environment:`, so it overrides.
       NODE_ENV: development
-      HMAC_SECRET_PATH: /run/secrets/hmac-shared-secret
     env_file:
       - ../Ycare-HMS/.env
     volumes:
@@ -88,8 +87,6 @@ services:
       - /app/node_modules
       - /app/.next
       - ./scripts:/scripts:ro
-      # Shared HMAC secret — hms-app signs outgoing summary-api requests with it.
-      - ./secrets/hmac-shared-secret:/run/secrets/hmac-shared-secret:ro
     ports:
       - "3000:3000"
     depends_on:
