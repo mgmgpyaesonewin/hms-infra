@@ -24,7 +24,9 @@ services:
   # `docker compose down -v` first. The files are applied alphabetically:
   #   01-hms-schema.sql        — 236 HMS tables dumped from prod RDS
   #   02-summary-dev-bridge.sql — uuidv7() plpgsql wrapper + pgcrypto
-  #   03-summary-schema.sql    — event_outbox + CFI tables (canonical DDL)
+  #   03-summary-schema.sql    — SUPERSEDED (empty); summary tables now live in
+  #                              Ycare-HMS Prisma migrations. After `up`, run
+  #                              `npm run migrate:deploy` in the hms-app container.
   # ---------------------------------------------------------------------------
   postgres:
     image: postgres:17-alpine
@@ -72,18 +74,22 @@ services:
     command: ["npm", "run", "dev"]
     environment:
       DATABASE_URL: postgres://admin:testtest@postgres:5432/ycare_hms_dev
-      # The user's hms-app/.env provides the rest (module toggles, AWS keys,
+      PORT: 3000   # override .env PORT (6000 is browser-reserved for x11)
+      # The user's Ycare-HMS/.env provides the rest (module toggles, AWS keys,
       # etc.). env_file is loaded AFTER `environment:`, so it overrides.
       NODE_ENV: development
+      HMAC_SECRET_PATH: /run/secrets/hmac-shared-secret
     env_file:
-      - ../hms-app/.env
+      - ../Ycare-HMS/.env
     volumes:
-      - ../hms-app:/app
+      - ../Ycare-HMS:/app
       # Anonymous volume layered on top of the bind mount — keeps the
       # container's node_modules isolated from the host checkout.
       - /app/node_modules
       - /app/.next
       - ./scripts:/scripts:ro
+      # Shared HMAC secret — hms-app signs outgoing summary-api requests with it.
+      - ./secrets/hmac-shared-secret:/run/secrets/hmac-shared-secret:ro
     ports:
       - "3000:3000"
     depends_on:
