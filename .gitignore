@@ -1,6 +1,3 @@
 # Local env overrides
 .env
 .env.local
-
-# HMAC shared secret (mode 0400 on disk; never commit)
-secrets/hmac-shared-secret
